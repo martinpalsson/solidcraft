@@ -26,6 +26,9 @@ pub const MAX_ITEMS: usize = 4_000_000;
 pub const MAX_SHELLS: usize = 1024;
 const MAX_DEPTH: usize = 16;
 const TAU: f64 = std::f64::consts::TAU;
+/// Most control points along one direction of a spline (a helical thread flank written as one
+/// spline has thousands along the helix); the item budget bounds a surface's grid as a whole.
+pub const MAX_SPLINE_CONTROLS: usize = 8192;
 
 /// A body (SMLib `SmBrep`, STEP `MANIFOLD_SOLID_BREP`/`BREP_WITH_VOIDS`/`SHELL_BASED_SURFACE_MODEL`).
 /// Every list is in canonical order (docs/native-brep.md, "Canonical order"): a face's index
@@ -272,7 +275,7 @@ fn knots(values: &[f64], count: usize, budget: &mut Budget) -> Result<()> {
     budget.add(values.len())?;
     numbers(values.iter().copied())?;
     let degree = values.len().checked_sub(count.saturating_add(1)).ok_or(Invalid("spline degree"))?;
-    require((2..=4096).contains(&count) && (1..=16).contains(&degree) && degree < count, "spline degree or size")?;
+    require((2..=MAX_SPLINE_CONTROLS).contains(&count) && (1..=16).contains(&degree) && degree < count, "spline degree or size")?;
     require(values.windows(2).all(|w| w.first() <= w.get(1)), "unordered knots")?;
     require(values.get(degree) < values.get(count), "empty spline domain")?;
     // No knot may have multiplicity greater than degree + 1.

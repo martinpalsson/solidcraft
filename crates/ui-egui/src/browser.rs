@@ -6,6 +6,7 @@
 //! viewport, a double-click on a sketch edits it, and a right-click opens the item's menu
 //! ([`crate::context_menu`]).
 
+use crate::ui_kit::{Container, Surface};
 #[cfg(test)]
 #[path = "occurrence_ui_tests.rs"]
 mod occurrence_ui_tests;
@@ -21,6 +22,39 @@ mod features;
 
 pub(crate) fn reveal_feature(app: &mut SolveApp, id: u64, body: &str) {
     features::reveal(app, id, body);
+}
+
+/// Find in Browser for a body: open every row that holds it (the document, the placements down
+/// to it, its Bodies folder and any group around it) and scroll its row into view. The rows
+/// are opened here, not while drawing, because a collapsed ancestor never draws its children.
+pub(crate) fn reveal_body(app: &mut SolveApp, body: &str) {
+    app.ui.show_browser = true;
+    app.preferences.timeline_left_browser_collapsed = false;
+    app.tree.reveal_feature = None;
+    app.tree.reveal = Some(body.to_string());
+    let state = app.session.model.state();
+    let Some(source) = crate::open_meshing::session_world(&app.session).body(body).map(|selected| selected.definition_name().to_string()) else { return };
+    let Some(component) = state.body(&source).map(|definition| definition.component) else { return };
+    // Every component's first placement keeps the definition's name, so the owner must match too.
+    let Some((_, path, _)) = app
+        .session
+        .doc
+        .placements()
+        .into_iter()
+        .find(|(owner, path, _)| *owner == component && app.session.doc.world_body_name(&state, &source, *owner, path) == body)
+    else {
+        return;
+    };
+    app.tree.collapsed.remove("c0");
+    for depth in 1..=path.len() {
+        app.tree.collapsed.remove(&occurrence_key(&path[..depth]));
+    }
+    let scope = if path.is_empty() { format!("c{component}") } else { occurrence_key(&path) };
+    app.tree.collapsed.remove(&scope);
+    app.tree.collapsed.remove(&format!("{scope}/bodies"));
+    for g in app.session.doc.browser_groups.iter().filter(|g| g.component == component && g.folder == "bodies" && g.items.contains(&source)) {
+        app.tree.collapsed.remove(&format!("{scope}/g{}", g.id));
+    }
 }
 
 #[cfg(test)]
@@ -67,9 +101,11 @@ pub struct TreeState {
     pub collapsed: BTreeSet<String>,
     /// Folders opened by the user (folders that start closed).
     pub expanded: BTreeSet<String>,
-    /// Scroll to this body's row and open its folders (Find in Browser).
+    /// Scroll to this body's row (by the name it has in the world, which tells the placements
+    /// of a part apart) and open the components, placements and folders above it: Find in
+    /// Browser, and a body picked in the viewport (#3005).
     pub reveal: Option<String>,
-    /// A native feature to reveal in its placed component's Features folder.
+    /// A native feature to reveal in its placed component's Features folder (Find in Timeline).
     pub(super) reveal_feature: Option<features::Reveal>,
     /// The Move/Copy panel of an occurrence.
     pub occurrence_move: Option<OccMove>,
@@ -91,6 +127,8 @@ pub struct TreeState {
     /// A Section Analysis hidden with its eye in the Analysis folder: its plane (origin,
     /// normal), so the eye can bring it back (#822).
     pub hidden_section: Option<(solidcraft_engine::geom::Vec3, solidcraft_engine::geom::Vec3)>,
+    /// What the Section Analysis dialog's OK last made, for Edit to start from.
+    pub section_dialog: Option<crate::dialogs::SectionDraft>,
     /// The Analysis folder hidden with its own eye, and the Section Analysis hidden with its
     /// own: the section shows only while neither is, and each eye keeps its state.
     pub analysis_hidden: bool,
@@ -101,6 +139,9 @@ pub struct TreeState {
     anchor: Option<String>,
     /// Row keys in drawing order this frame (for Shift ranges).
     order: Vec<String>,
+    /// The previous frame's complete row order: a Shift click resolves its range here, since
+    /// this frame's `order` does not yet hold the rows below the clicked one (#4991).
+    order_prev: Vec<String>,
 }
 
 /// Moving an occurrence: the offsets typed so far (pending until Capture Position).
@@ -132,7 +173,7 @@ impl OccMove {
 // ---------------------------------------------------------------------------------------------
 
 /// Is a sketch shown itself (its eye)? A hidden Sketches folder or component still keeps it out
-/// of the viewport (`solidcraft_engine::view::sketch_drawn`).
+/// of the viewport (`solidcraft_engine::view::sketch_shown`).
 pub fn sketch_visible(app: &SolveApp, id: u64) -> bool {
     if app.session.visibility.hidden_sketches.contains(&id) {
         return false;
@@ -141,13 +182,8 @@ pub fn sketch_visible(app: &SolveApp, id: u64) -> bool {
 }
 
 pub fn set_sketch_visible(app: &mut SolveApp, id: u64, on: bool) {
-    app.session.visibility.hidden_sketches.retain(|x| *x != id);
-    app.session.visibility.shown_sketches.retain(|x| *x != id);
-    if on {
-        app.session.visibility.shown_sketches.push(id);
-    } else {
-        app.session.visibility.hidden_sketches.push(id);
-    }
+    // Through the command, so showing or hiding a sketch is an undo step too (#2219).
+    let _ = app.run("browser.visibility", json!({ "items": [id], "visible": on }));
 }
 
 pub fn redefine_sketch(app: &mut SolveApp, id: u64) {
@@ -257,7 +293,7 @@ pub fn group_action(app: &mut SolveApp, action: &str, p: &Value) {
                 && let Some(g) = r.get("group").and_then(Value::as_u64)
             {
                 app.tree.collapsed.remove(&format!("c{comp}/{folder}"));
-                app.tree.collapsed.remove(&format!("g{g}"));
+                app.tree.collapsed.remove(&format!("c{comp}/g{g}"));
             }
         }
         "ui.ungroup" => {
@@ -276,7 +312,7 @@ pub fn group_action(app: &mut SolveApp, action: &str, p: &Value) {
 // Drawing
 // ---------------------------------------------------------------------------------------------
 
-const ROW_H: f32 = 26.0;
+const ROW_H: f32 = crate::ui_kit::TREE_ROW_HEIGHT;
 /// The floating card's inner margin: the header highlight sits this far from the card's top, left
 /// and right edges, so its corners are concentric with the card's.
 const CARD_INSET: f32 = 4.0;
@@ -354,9 +390,9 @@ pub(crate) fn draw_row(ui: &mut egui::Ui, id: egui::Id, row: &Row) -> RowResp {
     let dragged_over = egui::DragAndDrop::has_any_payload(ui.ctx()) && ui.input(|i| i.pointer.hover_pos()).is_some_and(|p| r.contains(p));
     let mut out = RowResp { rect: Some(r), hovered: resp.hovered() || dragged_over, ..Default::default() };
     if row.selected {
-        ui.painter().rect_filled(r, 3.0, crate::theme::TabAccent::current(ui.ctx()).soft);
+        ui.painter().rect_filled(r, t.radius_sm.saturating_sub(1), crate::theme::TabAccent::current(ui.ctx()).soft);
     } else if resp.hovered() || row.mark == Mark::Here {
-        ui.painter().rect_filled(r, 3.0, t.hover);
+        ui.painter().rect_filled(r, t.radius_sm.saturating_sub(1), t.hover);
     }
     // A lit item (selected, or under the pointer in the 3D view): a bar down the left of its row,
     // and a fainter, thinner one on each row leading to it, so the bars trace its branch.
@@ -366,7 +402,7 @@ pub(crate) fn draw_row(ui: &mut egui::Ui, id: egui::Id, row: &Row) -> RowResp {
         Mark::Here => Some((3.0, t.accent)),
     };
     if let Some((w, colour)) = bar {
-        ui.painter().rect_filled(Rect::from_min_size(r.left_top() + vec2(0.0, 2.0), vec2(w, r.height() - 4.0)), 1.0, colour);
+        ui.painter().rect_filled(Rect::from_min_size(r.left_top() + vec2(0.0, 2.0), vec2(w, r.height() - 4.0)), t.radius_sm / 4, colour);
     }
     let mut x = r.left() + 2.0 + row.depth as f32 * INDENT;
     let cy = r.center().y;
@@ -475,10 +511,8 @@ fn click_select(app: &mut SolveApp, ui: &egui::Ui, key: String, sel: Option<Sel>
     if mods.shift
         && let Some(a) = app.tree.anchor.clone()
     {
-        let order = app.tree.order.clone();
-        if let (Some(i), Some(j)) = (order.iter().position(|k| *k == a), order.iter().position(|k| *k == key)) {
-            let (lo, hi) = (i.min(j), i.max(j));
-            let items: Vec<Sel> = order[lo..=hi].iter().filter_map(|k| sel_of_key(k)).collect();
+        let items = shift_range(&app.tree.order_prev, &a, &key).or_else(|| shift_range(&app.tree.order, &a, &key));
+        if let Some(items) = items {
             let _ = app.run("select.set", json!({ "items": items, "add": mods.command || mods.ctrl }));
             return;
         }
@@ -499,6 +533,15 @@ fn click_select(app: &mut SolveApp, ui: &egui::Ui, key: String, sel: Option<Sel>
     }
 }
 
+/// The selectable rows from `anchor` to `key` (either way round) in a row order, or `None`
+/// when the order lacks either of them.
+fn shift_range(order: &[String], anchor: &str, key: &str) -> Option<Vec<Sel>> {
+    let i = order.iter().position(|k| k == anchor)?;
+    let j = order.iter().position(|k| k == key)?;
+    let rows = order.get(i.min(j)..=i.max(j))?;
+    Some(rows.iter().filter_map(|k| sel_of_key(k)).collect())
+}
+
 fn sel_of_key(k: &str) -> Option<Sel> {
     if let Some((_, id)) = k.rsplit_once("/s:") {
         return id.parse().ok().map(|id| Sel::Feature { id });
@@ -516,6 +559,31 @@ fn sel_of_key(k: &str) -> Option<Sel> {
     None
 }
 
+/// The body a selection item is on: a body, or a face or edge of one (by its name in the
+/// world).
+pub(crate) fn picked_body(sel: &Sel) -> Option<&str> {
+    match sel {
+        Sel::Body { name } => Some(name),
+        Sel::Face { body, .. } | Sel::Edge { body, .. } => Some(body),
+        _ => None,
+    }
+}
+
+/// A pick in the viewport: the Browser, when shown, opens down to the picked body's row and
+/// scrolls to it (#3005). The body of the last item picked.
+pub(crate) fn reveal_pick(app: &mut SolveApp) {
+    if app.ui.show_browser
+        && let Some(body) = app.session.selection.last().and_then(picked_body)
+    {
+        app.tree.reveal = Some(body.to_string());
+    }
+}
+
+/// Whether the body being revealed is in this placement or one below it: it opens.
+fn reveals_in_occurrence(app: &SolveApp, path: &[u64]) -> bool {
+    app.tree.reveal.as_ref().is_some_and(|r| app.session.occurrence_bodies(path, true).is_ok_and(|bodies| bodies.contains(r)))
+}
+
 pub(crate) fn is_open(app: &SolveApp, key: &str, default: bool) -> bool {
     if default { !app.tree.collapsed.contains(key) } else { app.tree.expanded.contains(key) }
 }
@@ -527,6 +595,26 @@ pub(crate) fn toggle(app: &mut SolveApp, key: &str, default: bool) {
         }
     } else if !app.tree.expanded.remove(key) {
         app.tree.expanded.insert(key.to_string());
+    }
+}
+
+/// Apply Expand All / Collapse All: open-by-default keys live in `collapsed` when closed;
+/// closed-by-default keys live in `expanded` when open.
+pub fn apply_fold(app: &mut SolveApp, open: bool, open_by_default: &[String], closed_by_default: &[String]) {
+    if open {
+        for key in open_by_default {
+            app.tree.collapsed.remove(key);
+        }
+        for key in closed_by_default {
+            app.tree.expanded.insert(key.clone());
+        }
+    } else {
+        for key in open_by_default {
+            app.tree.collapsed.insert(key.clone());
+        }
+        for key in closed_by_default {
+            app.tree.expanded.remove(key);
+        }
     }
 }
 
@@ -580,10 +668,12 @@ impl Lit {
                 Sel::Profile { sketch, .. } | Sel::ExternalSketchCurve { sketch, .. } | Sel::ExternalSketchPoint { sketch, .. } => {
                     Thing::Sketch(*sketch)
                 }
-                Sel::SketchCurve { .. } | Sel::SketchPoint { .. } | Sel::SketchConstraint { .. } => match app.session.active_sketch {
-                    Some(id) => Thing::Sketch(id),
-                    None => continue,
-                },
+                Sel::SketchCurve { .. } | Sel::SketchPoint { .. } | Sel::SketchMidpoint { .. } | Sel::SketchConstraint { .. } => {
+                    match app.session.active_sketch {
+                        Some(id) => Thing::Sketch(id),
+                        None => continue,
+                    }
+                }
                 Sel::Plane { name } => Thing::Plane(name.clone()),
                 Sel::Axis { name } => Thing::Axis(name.clone()),
                 Sel::Occurrence { .. } => continue,
@@ -591,7 +681,9 @@ impl Lit {
         }
         let hovered = match &app.viewport.hover {
             Some(Hit::Face { body, .. } | Hit::Edge { body, .. } | Hit::Vertex { body, .. }) => Some(Thing::Body(body.clone())),
-            Some(Hit::SketchPoint { sketch, .. } | Hit::SketchCurve { sketch, .. } | Hit::Profile { sketch, .. }) => Some(Thing::Sketch(*sketch)),
+            Some(
+                Hit::SketchPoint { sketch, .. } | Hit::SketchMidpoint { sketch, .. } | Hit::SketchCurve { sketch, .. } | Hit::Profile { sketch, .. },
+            ) => Some(Thing::Sketch(*sketch)),
             Some(Hit::Plane { name, .. }) => Some(Thing::Plane(name.clone())),
             Some(Hit::Axis { name }) => Some(Thing::Axis(name.clone())),
             None => None,
@@ -660,15 +752,6 @@ fn lit_row((selected, hovered): (bool, bool)) -> (bool, Mark) {
     (selected, if selected || hovered { Mark::Here } else { Mark::None })
 }
 
-pub fn browser(app: &mut SolveApp, ui: &mut egui::Ui) {
-    browser_panel(app, ui, false);
-}
-
-/// The left-sidebar layout: feature history first, parts and scene browser below it.
-pub fn browser_below_timeline(app: &mut SolveApp, ui: &mut egui::Ui) {
-    browser_panel(app, ui, true);
-}
-
 /// How narrow the browser sidebar may be dragged, and how wide (the viewport keeps the rest).
 const MIN_BROWSER_WIDTH: f32 = 170.0;
 const MAX_BROWSER_WIDTH: f32 = 620.0;
@@ -677,117 +760,84 @@ const BROWSER_RAIL: f32 = 6.0;
 /// How opaque the floating browser's card is; the workspace shows through the rest.
 const BROWSER_FLOAT_ALPHA: f32 = 0.4;
 
-fn browser_panel(app: &mut SolveApp, ui: &mut egui::Ui, timeline_above: bool) {
-    let t = Tokens::get();
-    app.tree.order.clear();
-    DRAWN.with(|d| d.borrow_mut().clear());
-    OCCURRENCES.with(|d| d.borrow_mut().clear());
-    let mut acts = Actions::default();
-    let width = browser_width(app.preferences.browser_width);
-    let panel = egui::Panel::left("sc_browser")
-        .exact_size(width)
-        .resizable(false)
-        .frame(egui::Frame::NONE.fill(t.panel).inner_margin(egui::Margin::symmetric(t.space_6 as i8, t.space_6 as i8)))
-        .show(ui, |ui| {
-            if timeline_above {
-                let available = ui.available_height();
-                let browser_collapsed = app.preferences.timeline_left_browser_collapsed;
-                let max_timeline_height = (available - if browser_collapsed { 30.0 } else { 130.0 }).max(150.0);
-                let remembered = app.preferences.timeline_left_height;
-                let timeline_height =
-                    if remembered.is_finite() { remembered.clamp(150.0, max_timeline_height) } else { 360.0_f32.clamp(150.0, max_timeline_height) };
-                ui.allocate_ui_with_layout(vec2(ui.available_width(), timeline_height), egui::Layout::top_down(egui::Align::Min), |ui| {
-                    crate::timeline_left::left_timeline(app, ui)
-                });
-                if !browser_collapsed {
-                    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 8.0), egui::Sense::hover());
-                    let response = ui
-                        .interact(rect, egui::Id::new("left_history_divider"), egui::Sense::drag())
-                        .on_hover_cursor(egui::CursorIcon::ResizeVertical);
-                    if response.dragged() {
-                        let delta = ui.input(|input| input.pointer.delta().y);
-                        if delta.is_finite() {
-                            app.preferences.timeline_left_height = (timeline_height + delta).clamp(150.0, max_timeline_height);
-                        }
-                    }
-                    ui.painter().hline(rect.x_range(), rect.center().y, egui::Stroke::new(1.0, t.border));
-                    crate::scenario::publish_handle("left-history-divider", rect.center());
-                }
-                let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), crate::ui_kit::row_height()), Sense::click());
-                crate::ui_kit::disclosure(
-                    ui.painter(),
-                    pos2(rect.left() + t.form_section_icon_size / 2.0, rect.center().y),
-                    !browser_collapsed,
-                    t.text_dim,
-                );
-                ui.painter().text(
-                    pos2(rect.left() + t.form_section_icon_size + t.space_8, rect.center().y),
-                    egui::Align2::LEFT_CENTER,
-                    "BROWSER",
-                    crate::fonts::semibold(t.font_small),
-                    t.text_dim,
-                );
-                response
-                    .widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::CollapsingHeader, ui.is_enabled(), !browser_collapsed, "BROWSER"));
-                crate::scenario::publish_handle("left-browser-toggle", response.rect.center());
-                if response.clicked() {
-                    app.preferences.timeline_left_browser_collapsed = !browser_collapsed;
-                }
-                if !browser_collapsed {
-                    ui.add_space(t.space_4);
-                    browser_rows(app, ui, &mut acts);
-                }
-            } else {
-                browser_contents(app, ui, &mut acts, false);
-            }
-        });
-    resize_browser(app, ui, panel.response.rect, width);
-    finish_browser(app, ui, acts);
-}
-
-fn browser_width(remembered: f32) -> f32 {
+pub(crate) fn browser_width(remembered: f32) -> f32 {
     if remembered.is_finite() { remembered.clamp(MIN_BROWSER_WIDTH, MAX_BROWSER_WIDTH) } else { crate::prefs::DEFAULT_BROWSER_WIDTH }
 }
 
-fn resize_browser(app: &mut SolveApp, ui: &egui::Ui, rect: Rect, width: f32) {
+/// Either card in a stacked column changes the same remembered width.
+pub(crate) fn resize_column(app: &mut SolveApp, ui: &egui::Ui, rect: Rect, width: f32, handle: &'static str) {
     let rail = Rect::from_x_y_ranges(rect.right() - BROWSER_RAIL..=rect.right(), rect.y_range());
-    let response = ui.interact(rail, egui::Id::new("sc_browser_rail"), Sense::drag()).on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+    let response =
+        ui.interact(rail, egui::Id::new(("sc_shared_column_rail", handle)), Sense::drag()).on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
     if response.dragged() {
         let delta = ui.input(|input| input.pointer.delta().x);
         if delta.is_finite() {
             app.preferences.browser_width = (width + delta).clamp(MIN_BROWSER_WIDTH, MAX_BROWSER_WIDTH);
         }
     }
-    crate::scenario::publish_handle("left-browser-rail", pos2(rect.right() - BROWSER_RAIL / 2.0, rect.center().y));
+    crate::scenario::publish_handle(handle, pos2(rect.right() - BROWSER_RAIL / 2.0, rect.center().y));
 }
 
-/// One browser card for the floating shell and the docked shell's optional overlay.
-/// The preference keeps its translucent overlay semantics; the floating shell always has a card.
-pub fn floating(app: &mut SolveApp, ui: &mut egui::Ui, available: Rect) {
+/// One content-hugging browser; the shared container supplies floating or flush compact chrome.
+pub fn browser(app: &mut SolveApp, ui: &mut egui::Ui) {
+    let available = ui.available_rect_before_wrap();
     let t = Tokens::get();
-    app.tree.order.clear();
+    app.tree.order_prev = std::mem::take(&mut app.tree.order);
     DRAWN.with(|d| d.borrow_mut().clear());
     OCCURRENCES.with(|d| d.borrow_mut().clear());
     let mut acts = Actions::default();
-    let gap = crate::shell::SHELL_GAP;
-    let top_gap = if app.ui.layout == crate::shell::LayoutMode::Docked { gap } else { 0.0 };
+    let stacked = crate::timeline_left::stacked(app);
+    let container =
+        Container::new(ui.ctx(), Surface::Panel).joined(crate::ui_kit::DockEdges { left: true, top: true, bottom: stacked, ..Default::default() });
+    let gap = container.gap();
     let width = browser_width(app.preferences.browser_width);
-    let bounds = floating_bounds(available, app.shell.history, width, top_gap);
+    let vertical = app.ui.show_timeline && app.preferences.timeline_left;
+    let mut available = available;
+    if !stacked {
+        available.min.x += crate::agent_chat::left_inset(app, available);
+    }
+    if vertical
+        && !stacked
+        && let Some(history) = app.shell.history
+    {
+        available.min.x = (history.right() + gap).min(available.right()) - gap;
+    }
+    let collapsed = vertical && !stacked && app.preferences.timeline_left_browser_collapsed;
+    let bounds = if stacked {
+        crate::timeline_left::stacked_rects(app, available).0
+    } else {
+        panel_bounds(available, if vertical { None } else { app.shell.history }, if collapsed { t.space_24 + t.space_10 } else { width }, gap)
+    };
     app.shell.browser = None;
     let min_height = HEADER_H + 2.0 * (CARD_INSET + 1.0);
     if bounds.is_positive() && bounds.height() >= min_height {
-        let fill = if app.preferences.browser_float { t.panel.gamma_multiply(BROWSER_FLOAT_ALPHA) } else { t.panel };
-        let frame = crate::frame::shell_card(fill).inner_margin(CARD_INSET as i8);
+        let fill = if container.floating() && app.preferences.browser_float { t.panel.gamma_multiply(BROWSER_FLOAT_ALPHA) } else { t.panel };
+        let frame = container.frame(ui.ctx(), fill, crate::frame::Side::Left).inner_margin(CARD_INSET as i8);
         let inner_width = (bounds.width() - frame.total_margin().sum().x).max(0.0);
         let inner_height = (bounds.height() - frame.total_margin().sum().y).max(0.0);
-        let card = crate::frame::area(egui::Id::new("sc_browser_card")).fixed_pos(bounds.min).order(egui::Order::Middle).show(ui.ctx(), |ui| {
-            let response = frame.show(ui, |ui| {
-                ui.set_width(inner_width);
-                ui.set_max_height(inner_height);
-                browser_contents(app, ui, &mut acts, true);
+        let card = Container::new(ui.ctx(), Surface::Panel)
+            .area(egui::Id::new("sc_browser_card"))
+            .fixed_pos(bounds.min)
+            .order(egui::Order::Middle)
+            .show(ui.ctx(), |ui| {
+                let limits = Rect::from_min_max(available.min, pos2(available.right(), bounds.bottom()));
+                let response = container.show_frame(ui, frame, limits, |ui| {
+                    ui.set_width(inner_width);
+                    ui.set_max_height(inner_height);
+                    if stacked {
+                        ui.set_min_height(inner_height);
+                        ui.set_clip_rect(ui.clip_rect().intersect(Rect::from_min_size(ui.max_rect().min, vec2(inner_width, inner_height))));
+                    }
+                    if collapsed {
+                        browser_collapsed_rail(app, ui);
+                    } else {
+                        browser_contents(app, ui, &mut acts, true);
+                    }
+                });
+                if !collapsed {
+                    resize_column(app, ui, response.response.rect, width, "left-browser-rail");
+                }
             });
-            resize_browser(app, ui, response.response.rect, width);
-        });
         let rect = card.response.rect;
         app.shell.browser = Some(rect);
         crate::scenario::publish_rect("browser:card", rect);
@@ -799,9 +849,35 @@ pub fn floating(app: &mut SolveApp, ui: &mut egui::Ui, available: Rect) {
     finish_browser(app, ui, acts);
 }
 
-fn floating_bounds(available: Rect, history: Option<Rect>, width: f32, top_gap: f32) -> Rect {
-    let gap = crate::shell::SHELL_GAP;
-    let min = available.min + vec2(gap, top_gap);
+fn browser_collapsed_rail(app: &mut SolveApp, ui: &mut egui::Ui) {
+    let t = Tokens::get();
+    let title_top = t.space_24 + ui.spacing().item_spacing.y;
+    let height = title_top + t.space_24 * 4.0 + t.space_8;
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
+    // Include the card margin in the hit target; keep the tint inside that margin.
+    let response =
+        ui.interact(rect.expand(CARD_INSET + 1.0), ui.id().with("browser_header"), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
+    if response.hovered() || response.has_focus() {
+        crate::ui_kit::panel_header_hover(ui.painter(), rect);
+    }
+    let disclosure = Rect::from_min_size(rect.min, vec2(rect.width(), t.space_24));
+    crate::ui_kit::disclosure(ui.painter(), disclosure.center(), false, t.text_dim);
+    crate::scenario::publish_handle("left-browser-toggle", disclosure.center());
+    crate::scenario::publish_target("browser:header", disclosure);
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), crate::i18n::tr("ui.browser_title")));
+    if response.on_hover_text(crate::i18n::tr("ui.browser_expand")).clicked() {
+        app.preferences.timeline_left_browser_collapsed = false;
+    }
+    let galley = ui.painter().layout_no_wrap(crate::i18n::tr("ui.browser_title").to_owned(), crate::fonts::semibold(t.font_body), t.text);
+    let title = Rect::from_min_max(rect.min + vec2(0.0, title_top), rect.max);
+    ui.painter().add(
+        egui::epaint::TextShape::new(title.center() - galley.size() / 2.0, galley, t.text)
+            .with_angle_and_anchor(std::f32::consts::FRAC_PI_2, egui::Align2::CENTER_CENTER),
+    );
+}
+
+pub(crate) fn panel_bounds(available: Rect, history: Option<Rect>, width: f32, gap: f32) -> Rect {
+    let min = available.min + vec2(gap, 0.0);
     let right = (available.right() - gap).max(min.x);
     let bottom = history.map_or(available.bottom() - gap, |r| r.top() - gap).max(min.y);
     Rect::from_min_max(min, pos2((min.x + width).min(right), bottom))
@@ -811,12 +887,23 @@ fn browser_contents(app: &mut SolveApp, ui: &mut egui::Ui, acts: &mut Actions, c
     let t = Tokens::get();
     // Only the floating card folds; the docked column keeps its full height.
     browser_header(app, ui, collapsible);
-    if collapsible && app.tree.panel_collapsed {
+    let stacked = crate::timeline_left::stacked(app);
+    if collapsible
+        && (if stacked {
+            (app.preferences.timeline_left_browser_collapsed && app.shell.history_folding.is_none_or(|p| p[0] >= 1.0))
+                || ui.available_height() <= t.space_3
+        } else {
+            app.tree.panel_collapsed && !(app.ui.show_timeline && app.preferences.timeline_left)
+        })
+    {
         return;
     }
-    ui.painter().hline(ui.max_rect().x_range(), ui.cursor().top() + 1.0, egui::Stroke::new(1.0, t.toolbar.lerp_to_gamma(t.border, 0.5)));
+    if crate::render_workspace::browser_mode(app, ui) {
+        return;
+    }
+    t.secondary_hline(ui.painter(), ui.max_rect().x_range(), ui.cursor().top() + 1.0, t.toolbar.lerp_to_gamma(t.border, 0.5));
     ui.add_space(t.space_3);
-    if collapsible {
+    if collapsible && !stacked {
         browser_rows_hugging(app, ui, acts);
     } else {
         browser_rows(app, ui, acts);
@@ -830,9 +917,14 @@ fn browser_header(app: &mut SolveApp, ui: &mut egui::Ui, collapsible: bool) {
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), HEADER_H), Sense::hover());
     let response = ui.interact(rect, ui.id().with("browser_header"), if collapsible { Sense::click() } else { Sense::hover() });
     crate::scenario::publish_target("browser:header", rect);
-    let collapsed = collapsible && app.tree.panel_collapsed;
+    let vertical = app.ui.show_timeline && app.preferences.timeline_left;
+    let stacked = crate::timeline_left::stacked(app);
+    let collapsed = collapsible && if stacked { app.preferences.timeline_left_browser_collapsed } else { !vertical && app.tree.panel_collapsed };
+    if vertical {
+        crate::scenario::publish_handle("left-browser-toggle", rect.center());
+    }
     if collapsible && (response.hovered() || response.has_focus()) {
-        ui.painter().rect_filled(rect, t.radius_lg.saturating_sub(CARD_INSET as u8), t.hover);
+        crate::ui_kit::panel_header_hover(ui.painter(), rect);
     }
     let title = crate::i18n::tr("ui.browser_title").to_string();
     let kind = if collapsible { egui::WidgetType::Button } else { egui::WidgetType::Label };
@@ -851,8 +943,14 @@ fn browser_header(app: &mut SolveApp, ui: &mut egui::Ui, collapsible: bool) {
     ui.painter().galley(pos2(right - galley.size().x, rect.center().y - galley.size().y / 2.0), galley, t.text_dim);
     if collapsible {
         let tip = crate::i18n::tr(if collapsed { "ui.browser_expand" } else { "ui.browser_collapse" });
-        if response.on_hover_text(tip).clicked() {
-            app.tree.panel_collapsed = !app.tree.panel_collapsed;
+        if response.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(tip).clicked() {
+            if stacked {
+                app.preferences.timeline_left_browser_collapsed = !app.preferences.timeline_left_browser_collapsed;
+            } else if vertical {
+                app.preferences.timeline_left_browser_collapsed = true;
+            } else {
+                app.tree.panel_collapsed = !app.tree.panel_collapsed;
+            }
         }
     }
 }
@@ -923,12 +1021,17 @@ fn rows_scrolling(app: &mut SolveApp, ui: &mut egui::Ui, acts: &mut Actions, shr
     prepare_model(app);
     acts.lit = Lit::of(app);
     egui::ScrollArea::vertical()
+        // The card may animate all the way down to its header.
+        .min_scrolled_height(0.0)
         .auto_shrink([false, shrink_height])
         .scroll_source(egui::scroll_area::ScrollSource { scroll_bar: true, mouse_wheel: true, ..egui::scroll_area::ScrollSource::NONE })
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
             component_rows(app, ui, 0, 0, acts);
         });
+    // The row was reached and scrolled to, or isn't in the tree (a body a later feature removes):
+    // either way the reveal is done.
+    app.tree.reveal = None;
 }
 
 fn finish_browser(app: &mut SolveApp, ui: &mut egui::Ui, acts: Actions) {
@@ -959,9 +1062,14 @@ fn component_name(app: &SolveApp, id: u64) -> String {
 fn component_rows(app: &mut SolveApp, ui: &mut egui::Ui, id: u64, depth: usize, acts: &mut Actions) {
     let t = Tokens::get();
     let key = format!("c{id}");
+    let bodies = crate::context_menu::component_bodies(app, id);
+    if let Some(r) = app.tree.reveal.clone()
+        && (bodies.contains(&r) || model_children(app, id).into_iter().any(|o| reveals_in_occurrence(app, &[o])))
+    {
+        app.tree.collapsed.remove(&key);
+    }
     let open = is_open(app, &key, true);
     let active = app.session.active_component == id;
-    let bodies = crate::context_menu::component_bodies(app, id);
     let visible = bodies.is_empty() || bodies.iter().any(|b| !app.session.visibility.hidden_bodies.contains(b));
     let grounded = app.session.doc.occurrence_of(id).is_some_and(|o| o.grounded);
     let faded = app.session.active_component != 0 && !app.session.doc.component_within(id, app.session.active_component) && !active;
@@ -1064,6 +1172,9 @@ fn occurrence_key(path: &[u64]) -> String {
 fn occurrence_rows(app: &mut SolveApp, ui: &mut egui::Ui, path: Vec<u64>, depth: usize, acts: &mut Actions) {
     let Some(placement) = model_placement(app, &path) else { return };
     let key = occurrence_key(&path);
+    if reveals_in_occurrence(app, &path) {
+        app.tree.collapsed.remove(&key);
+    }
     let open = is_open(app, &key, true);
     let active = app.session.active_occurrence_path.as_deref() == Some(path.as_slice())
         || (app.session.active_occurrence_path.is_none()
@@ -1162,6 +1273,8 @@ fn occurrence_rows(app: &mut SolveApp, ui: &mut egui::Ui, path: Vec<u64>, depth:
     }
 }
 
+/// The Document Settings group. A second click on an entry closes the window it opened, the way
+/// that window's own × does (#4150).
 fn doc_settings(app: &mut SolveApp, ui: &mut egui::Ui, depth: usize) {
     let key = "docsettings";
     let open = is_open(app, key, false);
@@ -1174,8 +1287,12 @@ fn doc_settings(app: &mut SolveApp, ui: &mut egui::Ui, depth: usize) {
     }
     let units = format!("Units: {}", app.session.doc.units);
     let r = draw_row(ui, ui.id().with("units"), &Row { depth: depth + 1, icon: "settings", label: &units, ..Default::default() });
-    if let Some(p) = r.secondary.or(r.clicked.then(|| r.rect.map(|x| x.left_bottom())).flatten()) {
+    if let Some(p) = r.secondary {
         crate::context_menu::open_for(app, p, Target::Units);
+    } else if r.clicked
+        && let Some(rect) = r.rect
+    {
+        crate::context_menu::toggle_for(app, rect, rect.left_bottom(), Target::Units);
     }
     let prec = format!(
         "Precision: {} {}, {}°",
@@ -1184,16 +1301,28 @@ fn doc_settings(app: &mut SolveApp, ui: &mut egui::Ui, depth: usize) {
         format_args!("{:.*}", usize::from(app.preferences.angle_decimals), 0.0)
     );
     if draw_row(ui, ui.id().with("precision"), &Row { depth: depth + 1, icon: "settings", label: &prec, ..Default::default() }).clicked {
-        app.prefs_window.open = true;
+        if app.prefs_window.open {
+            crate::prefs::close(app, true);
+        } else {
+            app.prefs_window.open = true;
+        }
     }
     let params = format!("Parameters ({})", app.session.doc.params.len());
     if draw_row(ui, ui.id().with("params"), &Row { depth: depth + 1, icon: "params", label: &params, ..Default::default() }).clicked {
-        app.start("parameters.change");
+        if app.params.is_some() {
+            app.params = None;
+        } else {
+            app.start("parameters.change");
+        }
     }
     if draw_row(ui, ui.id().with("design_properties"), &Row { depth: depth + 1, icon: "settings", label: "Design Properties", ..Default::default() })
         .clicked
     {
-        app.start("document.metadata");
+        if app.design_properties.is_some() {
+            app.design_properties = None;
+        } else {
+            app.start("document.metadata");
+        }
     }
 }
 
@@ -1222,10 +1351,10 @@ fn origin_rows(app: &mut SolveApp, ui: &mut egui::Ui, depth: usize, acts: &Actio
         &Row {
             depth,
             fold: Some(open),
-            eye: Some(app.ui.show_origin),
+            eye: Some(app.origin_shown()),
             icon: "origin",
             label: "Origin",
-            dim: !app.ui.show_origin,
+            dim: !app.origin_shown(),
             mark: if items.iter().any(|(_, _, thing)| lit(thing) != (false, false)) { Mark::Branch } else { Mark::None },
             ..Default::default()
         },
@@ -1234,7 +1363,7 @@ fn origin_rows(app: &mut SolveApp, ui: &mut egui::Ui, depth: usize, acts: &Actio
         toggle(app, key, false);
     }
     if r.eye {
-        app.ui.show_origin = !app.ui.show_origin;
+        app.set_origin_shown(!app.origin_shown());
     }
     if let Some(p) = r.secondary {
         crate::context_menu::open_for(app, p, Target::Origin);
@@ -1255,14 +1384,11 @@ fn origin_rows(app: &mut SolveApp, ui: &mut egui::Ui, depth: usize, acts: &Actio
             ui,
             ui.id().with(("o", k)),
             // Faded when hidden itself or with the whole Origin.
-            &Row { depth: depth + 1, eye: Some(visible), icon, label, selected, dim: !visible || !app.ui.show_origin, mark, ..Default::default() },
+            &Row { depth: depth + 1, eye: Some(visible), icon, label, selected, dim: !visible || !app.origin_shown(), mark, ..Default::default() },
         );
         if r.eye {
-            if visible {
-                app.session.visibility.hidden_origin.push(k.into());
-            } else {
-                app.session.visibility.hidden_origin.retain(|h| h != k);
-            }
+            // Through the command, so the Origin row's eye is an undo step (#2219).
+            let _ = app.run("browser.visibility", json!({ "items": [k], "visible": !visible }));
         }
         if let Some(p) = r.secondary
             && icon == "plane"
@@ -1401,7 +1527,7 @@ fn analysis_rows(app: &mut SolveApp, ui: &mut egui::Ui, depth: usize, acts: &mut
         set_section_shown(app, !section_shown);
     }
     if r.double {
-        app.start("inspect.section");
+        crate::dialogs::edit_section(app);
     }
     if let Some(p) = r.secondary {
         acts.menu = Some((p, Target::Section));
@@ -1426,7 +1552,7 @@ pub fn set_section_visible(app: &mut SolveApp, visible: bool) {
     if visible {
         if let Some((origin, normal)) = app.tree.hidden_section {
             let plane = json!({"origin": [origin.x, origin.y, origin.z], "normal": [normal.x, normal.y, normal.z]});
-            if app.run("inspect.section", json!({ "plane": plane })).is_ok() {
+            if app.run("inspect.section", json!({"plane": plane, "hatch": app.session.section_hatch})).is_ok() {
                 app.tree.hidden_section = None;
             }
         }
@@ -1562,9 +1688,24 @@ impl CanvasPanel {
     }
 }
 
-/// A browser click on a plane or axis: it goes to the open dialog's input if that takes it,
-/// otherwise it becomes the selection.
+/// Does the open dialog's active input take bodies (Combine's target and tools, #4452)? Then a
+/// body clicked in the Browser goes there, as a click on it in the view does, rather than
+/// replacing the selection: overlapping bodies are often only told apart in the Browser.
+fn dialog_takes_body(app: &SolveApp) -> bool {
+    app.dialog.as_ref().and_then(|d| d.active_input()).is_some_and(|i| i.accept & crate::selection::BODIES != 0)
+}
+
+/// Browser picks go only into compatible active dialog inputs. Outside a dialog, planes and
+/// axes become the selection; body rows use the ordinary Ctrl/Shift-aware selection path.
 fn pick_from_browser(app: &mut SolveApp, x: Sel) {
+    if let Sel::Body { .. } = &x
+        && dialog_takes_body(app)
+        && let Some(mut d) = app.dialog.take()
+    {
+        d.pick(&app.session, x);
+        app.dialog = Some(d);
+        return;
+    }
     let hit = match &x {
         Sel::Plane { name } => crate::viewport::Hit::Plane { name: name.clone(), point: solidcraft_engine::geom::Vec3::ZERO },
         Sel::Axis { name } => crate::viewport::Hit::Axis { name: name.clone() },
@@ -1627,7 +1768,7 @@ fn entries(app: &SolveApp, comp: u64, folder: &str) -> Vec<Entry> {
                 visible: !app.session.visibility.hidden_bodies.contains(&b.name),
                 selected: sel.iter().any(|x| matches!(x, Sel::Body { name } if *name == b.name)),
                 color: None,
-                locked: app.ui.locked_bodies.contains(&b.name),
+                locked: app.session.visibility.locked_bodies.contains(&b.name),
                 sel: Some(Sel::Body { name: b.name.clone() }),
                 target: Some(Target::Body { name: b.name.clone() }),
                 bodies: vec![b.name.clone()],
@@ -1703,14 +1844,13 @@ fn arrange(app: &SolveApp, comp: u64, folder: &str, all: Vec<Entry>) -> (Vec<(so
     (grouped, loose)
 }
 
-/// Show or hide items of a folder.
+/// Show or hide items of a folder, through `browser.visibility` so each is an undo step (#2219).
 fn set_visible(app: &mut SolveApp, folder: &str, items: &[&Entry], on: bool) {
     for e in items {
         match folder {
             "bodies" => {
-                app.session.visibility.hidden_bodies.retain(|b| !e.bodies.contains(b));
-                if !on {
-                    app.session.visibility.hidden_bodies.extend(e.bodies.clone());
+                if !e.bodies.is_empty() {
+                    let _ = app.run("browser.visibility", json!({ "items": e.bodies.clone(), "visible": on }));
                 }
             }
             "sketches" => {
@@ -1719,10 +1859,7 @@ fn set_visible(app: &mut SolveApp, folder: &str, items: &[&Entry], on: bool) {
                 }
             }
             _ => {
-                app.session.visibility.hidden_origin.retain(|p| *p != e.label);
-                if !on {
-                    app.session.visibility.hidden_origin.push(e.label.clone());
-                }
+                let _ = app.run("browser.visibility", json!({ "items": [e.label], "visible": on }));
             }
         }
     }
@@ -1787,11 +1924,11 @@ fn folder_rows_at(app: &mut SolveApp, ui: &mut egui::Ui, comp: u64, path: Option
     let key = format!("{prefix}/{folder}");
     if let Some(r) = app.tree.reveal.clone()
         && folder == "bodies"
-        && all.iter().any(|e| e.key == r)
+        && let Some(e) = all.iter().find(|e| e.row_key == format!("b:{r}"))
     {
         app.tree.collapsed.remove(&key);
         app.tree.collapsed.remove(&format!("c{comp}"));
-        for g in app.session.doc.browser_groups.iter().filter(|g| g.items.contains(&r)) {
+        for g in app.session.doc.browser_groups.iter().filter(|g| g.items.contains(&e.key)) {
             app.tree.collapsed.remove(&format!("g{}", g.id));
         }
     }
@@ -1894,6 +2031,42 @@ fn folder_rows_at(app: &mut SolveApp, ui: &mut egui::Ui, comp: u64, path: Option
     let _ = t;
 }
 
+/// The body's name edited in its row (started by a double-click): Enter or leaving the box keeps
+/// the name, Escape cancels.
+fn inline_rename(app: &mut SolveApp, ui: &mut egui::Ui, row: Rect, e: &Entry, depth: usize) {
+    let editing = app.menu.rename.as_ref().is_some_and(|r| r.inline && matches!(&r.what, crate::context_menu::RenameWhat::Body(b) if *b == e.key));
+    if !editing {
+        return;
+    }
+    let Some(mut rename) = app.menu.rename.take() else { return };
+    // Where the label starts: the fold arrow, eye and icon come first.
+    let left = row.left() + 2.0 + depth as f32 * INDENT + 14.0 + 18.0 + 21.0;
+    let edit_rect = Rect::from_min_max(pos2(left, row.top() + 1.0), pos2(row.right() - 3.0, row.bottom() - 1.0));
+    ui.painter().rect_filled(edit_rect, 3.0, Tokens::get().field);
+    let id = ui.id().with(("browser_rename", &e.row_key));
+    let response = crate::ui_kit::inline_name(ui, edit_rect, id, &mut rename.text);
+    crate::scenario::publish_handle(&format!("rename:{}", e.key), edit_rect.center());
+    let was_focused = rename.focused;
+    if !rename.focused {
+        if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), id) {
+            let end = rename.text.chars().count();
+            state.cursor.set_char_range(Some(egui::text::CCursorRange::two(egui::text::CCursor::new(0), egui::text::CCursor::new(end))));
+            state.store(ui.ctx(), id);
+        }
+        response.request_focus();
+        rename.focused = true;
+    }
+    let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
+    let commit = ui.input(|i| i.key_pressed(egui::Key::Enter)) || (was_focused && response.lost_focus());
+    if escape {
+        // Dropping the state cancels the edit.
+    } else if commit {
+        crate::context_menu::commit_rename(app, &rename);
+    } else {
+        app.menu.rename = Some(rename);
+    }
+}
+
 /// One item row of a folder.
 #[allow(clippy::too_many_arguments)]
 fn entry_row(
@@ -1939,7 +2112,7 @@ fn entry_row(
         toggle(app, &pattern_key, true);
     }
     if folder == "bodies"
-        && app.tree.reveal.as_deref() == Some(e.key.as_str())
+        && app.tree.reveal.as_ref().is_some_and(|b| e.row_key.strip_prefix("b:") == Some(b.as_str()))
         && let Some(rect) = r.rect
     {
         ui.scroll_to_rect(rect, Some(egui::Align::Center));
@@ -1956,13 +2129,29 @@ fn entry_row(
             app.edit_sketch(id);
         }
     } else if r.clicked {
-        if folder == "construction" {
+        if folder == "construction" || (folder == "bodies" && app.dialog.is_some()) {
             if let Some(s) = e.sel.clone() {
                 pick_from_browser(app, s);
             }
         } else {
             click_select(app, ui, e.row_key.clone(), e.sel.clone());
         }
+        // A double-click renames the row (sketch rows open for editing instead), like F2. A body
+        // is edited in its own row.
+        if r.double {
+            crate::context_menu::rename_selection(app, r.rect.map(|x| x.left_bottom()).unwrap_or_default());
+            if folder == "bodies"
+                && let Some(rename) = app.menu.rename.as_mut()
+                && matches!(&rename.what, crate::context_menu::RenameWhat::Body(b) if *b == e.key)
+            {
+                rename.inline = true;
+            }
+        }
+    }
+    if folder == "bodies"
+        && let Some(rect) = r.rect
+    {
+        inline_rename(app, ui, rect, e, depth);
     }
     if r.hovered && !e.bodies.is_empty() {
         acts.hover_bodies = e.bodies.clone();
@@ -2022,7 +2211,9 @@ fn drop_target(ui: &egui::Ui, resp: &egui::Response, accept: impl Fn(&Drag) -> b
         let r = resp.rect;
         match mark {
             DropMark::Above => ui.painter().hline(r.x_range(), r.top(), Stroke::new(2.0, t.accent)),
-            DropMark::Box => ui.painter().rect_stroke(r.shrink(0.5), 3.0, Stroke::new(1.5, t.accent), egui::StrokeKind::Inside),
+            DropMark::Box => {
+                ui.painter().rect_stroke(r.shrink(0.5), t.radius_sm.saturating_sub(1), Stroke::new(1.5, t.accent), egui::StrokeKind::Inside)
+            }
         };
     }
     // Taking a payload takes it whatever its type: leave other drags (appearance swatches) be.
@@ -2134,7 +2325,7 @@ pub fn dims_overlay(app: &SolveApp, ctx: &egui::Context) {
     use solidcraft_engine::geom::Vec2;
     use solidcraft_engine::sketch::{DimFrame, chain_centres, default_text, dim_frame, dim_layout_reaching, dim_reach};
     let Some(rect) = app.viewport.rect else { return };
-    if app.ui.shown_dims.is_empty() {
+    if app.session.visibility.shown_dimensions.is_empty() {
         return;
     }
     let tk = Tokens::get();
@@ -2142,10 +2333,11 @@ pub fn dims_overlay(app: &SolveApp, ctx: &egui::Context) {
     let painter = ctx.layer_painter(egui::LayerId::background()).with_clip_rect(rect);
     let st = crate::open_meshing::session_world(&app.session);
     for id in app
-        .ui
-        .shown_dims
+        .session
+        .visibility
+        .shown_dimensions
         .iter()
-        .filter(|id| app.session.active_sketch != Some(**id) && solidcraft_engine::view::sketch_drawn(&app.session, **id, app.ui.show_sketches))
+        .filter(|id| app.session.active_sketch != Some(**id) && solidcraft_engine::view::sketch_shown(&app.session, **id))
     {
         let Some(ss) = st.sketch(*id) else { continue };
         let sk = &ss.sketch;
@@ -2186,7 +2378,7 @@ pub fn dims_overlay(app: &SolveApp, ctx: &egui::Context) {
             }
             let Some(tc) = to(lay.text) else { continue };
             let r = Rect::from_center_size(tc, size);
-            painter.rect_filled(r, 2.0, tk.viewport_top.gamma_multiply(0.85));
+            painter.rect_filled(r, tk.radius_sm / 2, tk.viewport_top.gamma_multiply(0.85));
             painter.galley(r.min + vec2(3.0, 1.0), galley, col);
         }
     }
@@ -2208,7 +2400,10 @@ pub const SAVE: &str = "__save";
 /// that capture, revert or keep moving.
 pub fn needs_capture(app: &SolveApp, what: &str) -> bool {
     !app.session.pending_moves.is_empty()
-        && !matches!(what, "component.capture_position" | "component.revert_position" | "occurrence.move" | "edit.undo" | "edit.redo")
+        && !matches!(
+            what,
+            "component.capture_position" | "component.revert_position" | "occurrence.move" | "occurrence.drag" | "edit.undo" | "edit.redo"
+        )
         && app.tree.capture_prompt.is_none()
 }
 

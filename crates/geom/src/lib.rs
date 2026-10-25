@@ -29,6 +29,7 @@ pub mod network;
 mod plane;
 mod profile;
 pub mod section;
+pub mod simplify;
 pub mod spline_space;
 pub mod tess;
 pub mod tspline;

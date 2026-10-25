@@ -43,6 +43,18 @@ pub fn has_geometry(sketch: &solidcraft_engine::sketch::Sketch) -> bool {
     !sketch.curves.is_empty() || !sketch.wires.is_empty()
 }
 
+/// Nothing the user added: no curve, 3D curve, constraint or dimension, pattern, projection,
+/// text or offset, and no point but the fixed origin.
+pub fn is_blank(sketch: &solidcraft_engine::sketch::Sketch) -> bool {
+    !has_geometry(sketch)
+        && sketch.constraints.is_empty()
+        && sketch.patterns.is_empty()
+        && sketch.links.is_empty()
+        && sketch.offsets.is_empty()
+        && sketch.freeform_offsets.is_empty()
+        && sketch.points.iter().all(|p| p.id == "origin")
+}
+
 /// The degrees-of-freedom line: "No geometry yet" (an empty sketch only has its fixed origin),
 /// "Fully constrained" or "N degrees of freedom".
 pub fn dof_text(dof: usize, ok: bool, has_geometry: bool) -> String {
@@ -225,7 +237,7 @@ fn width(vp: egui::Rect) -> f32 {
 
 /// The viewport the palette docks into.
 fn viewport(app: &SolveApp, ctx: &egui::Context) -> egui::Rect {
-    crate::shell::content_rect(app, app.viewport.rect.unwrap_or_else(|| ctx.content_rect()))
+    crate::agent_chat::tool_space(app, crate::shell::content_rect(app, app.viewport.rect.unwrap_or_else(|| ctx.content_rect())))
 }
 
 /// Is a sketch being edited? That is the palette's own condition.
@@ -322,10 +334,11 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     if !vp.is_finite() || !vp.is_positive() {
         return;
     }
-    let bottom = vp.bottom().min(ctx.content_rect().bottom()) - crate::shell::SHELL_GAP;
+    let gap = crate::ui_kit::Container::new(ctx, crate::ui_kit::Surface::Palette).gap();
+    let bottom = vp.bottom().min(ctx.content_rect().bottom()) - gap;
     let top = crate::shell::panel_top(app, vp, bottom, crate::frame::Side::Right);
     let frame = crate::ui_kit::Panel::palette_frame(ctx, app.ui.layout);
-    let anchor = egui::pos2(vp.right() - crate::shell::SHELL_GAP - frame.stroke.width, top + frame.stroke.width);
+    let anchor = egui::pos2(vp.right() - gap - frame.stroke.width, top + frame.stroke.width);
     let shown = |key: &str| match key {
         "grid" => !opts.hide_grid,
         "snap" => !opts.no_snap,
@@ -358,7 +371,7 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
         frame,
     )
     .width(width(vp));
-    let response = panel.window().show(ctx, |ui| {
+    let response = panel.window(ctx).show(ctx, |ui| {
         panel.palette(ui, bottom, top, |ui, part| match part {
             crate::ui_kit::Part::Header => {
                 let status = if !solved || !geometry || remaining == 0 {
@@ -388,7 +401,8 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
                     ui.horizontal(|ui| {
                         let text = crate::i18n::format("sketch.untied_ends", &[("count", &untied_ends.to_string())]);
                         ui.label(egui::RichText::new(text).size(t.font_small).color(t.warning)).on_hover_text(app.tr("ui.untied_ends_tip"));
-                        let button = crate::ui_kit::button(ui, "ui.tie_ends", crate::ui_kit::Button::Normal).on_hover_text(app.tr("ui.tie_ends_tip"));
+                        let button =
+                            crate::ui_kit::button(ui, app.tr("ui.tie_ends"), crate::ui_kit::Button::Normal).on_hover_text(app.tr("ui.tie_ends_tip"));
                         crate::scenario::publish_handle("sketch_palette:tie_ends", button.rect.center());
                         tie = button.clicked();
                     });
@@ -597,7 +611,12 @@ mod tests {
         h.app.run("sketch.create", json!({"plane":"XY"})).unwrap();
         h.settle();
         let at = crate::scenario::handle_at("sketch_palette:finish").expect("the palette ends in Finish Sketch");
-        assert!(crate::scenario::rect_of("sketch_palette:look_at").is_some(), "Look At | Slice stay");
+        let look = crate::scenario::rect_of("sketch_palette:look_at").expect("Look At | Slice stay");
+        let slice = crate::scenario::rect_of("sketch_palette:slice").unwrap();
+        let finish = crate::scenario::rect_of("sketch_palette:finish").unwrap();
+        assert_eq!((finish.left(), finish.right()), (look.left(), slice.right()), "Finish {finish:?} shares the pair's inset");
+        assert_eq!(finish.height(), Tokens::get().form_button_height);
+        assert_eq!(look.top() - finish.bottom(), 2.0 * Tokens::get().space_6, "same spacing as the pair");
         assert!(crate::scenario::handle_at("button:sketch.finish").is_some(), "and so does the ribbon's Finish");
         h.call("ui.click", json!({"x":at.x,"y":at.y}));
         assert!(h.app.session.active_sketch.is_none());
@@ -781,6 +800,7 @@ mod tests {
         h.settle();
         assert!(h.widget("Open 2").is_some(), "the status counts the open ends");
         assert!(h.widget("Untied 4").is_some(), "the status counts the untied ends");
+        assert!(h.widget("Tie").is_some(), "the Tie button shows its label, not its catalog key");
         let at = crate::scenario::handle_at("sketch_palette:tie_ends").unwrap();
         h.call("ui.click", json!({"x": at.x, "y": at.y}));
         h.settle();
@@ -950,5 +970,85 @@ mod tests {
         h.app.run("sketch.rectangle.two_point", json!({"p0":[0,0],"p1":[10,5]})).unwrap();
         h.settle();
         assert_ne!(line(&h), "No geometry yet", "a drawn rectangle is geometry");
+    }
+
+    /// One Esc cancels the tool and keeps the sketch open; two quick presses finish it (the
+    /// sketch is kept and listed in the timeline), also when the first press cancelled a tool.
+    #[test]
+    fn escape_cancels_then_a_quick_second_escape_finishes_the_sketch() {
+        let apart = |h: &mut crate::scenario::Harness| h.frames(60);
+        let mut h = crate::scenario::Harness::new();
+        h.app.run("sketch.create", json!({"plane":"XY"})).unwrap();
+        h.app.run("sketch.rectangle.two_point", json!({"p0":[0,0],"p1":[40,30]})).unwrap();
+        h.settle();
+        h.step(&json!({"start":"sketch.line"})).unwrap();
+        assert!(h.app.tool.is_some());
+        h.step(&json!({"key":"Escape"})).unwrap();
+        assert!(h.app.tool.is_none(), "one Esc puts the tool down");
+        apart(&mut h);
+        h.step(&json!({"key":"Escape"})).unwrap();
+        apart(&mut h);
+        assert!(h.app.session.active_sketch.is_some(), "single presses keep the sketch open");
+
+        // A quick double press finishes and keeps the sketch.
+        h.step(&json!({"key":"Escape"})).unwrap();
+        h.step(&json!({"key":"Escape"})).unwrap();
+        h.settle();
+        assert!(h.app.session.active_sketch.is_none(), "a double Esc finishes the sketch");
+        assert_eq!(h.app.ui.tab, "MODEL");
+        assert!(crate::scenario::handle_at("timeline:Sketch1").is_some(), "the sketch is kept");
+        let sketch = h.app.session.execute("sketch.inspect", &json!({"sketch": 1})).unwrap();
+        assert_eq!(sketch["curves"].as_array().map(Vec::len), Some(4), "{sketch}");
+
+        // With a tool active: the first press cancels it, the second finishes.
+        h.step(&json!({"click": {"handle": "timeline:Sketch1"}, "double": true})).unwrap();
+        h.settle();
+        assert!(h.app.session.active_sketch.is_some());
+        apart(&mut h);
+        h.step(&json!({"start":"sketch.circle.center"})).unwrap();
+        assert!(h.app.tool.is_some());
+        h.step(&json!({"key":"Escape"})).unwrap();
+        h.step(&json!({"key":"Escape"})).unwrap();
+        h.settle();
+        assert!(h.app.tool.is_none() && h.app.session.active_sketch.is_none());
+        assert!(crate::scenario::handle_at("timeline:Sketch1").is_some());
+        // Outside a sketch a double Esc only clears, as before.
+        h.step(&json!({"key":"Escape"})).unwrap();
+        h.step(&json!({"key":"Escape"})).unwrap();
+        assert!(h.app.session.active_sketch.is_none());
+    }
+
+    /// A double Esc on a sketch left blank takes it away (no empty sketch in the browser or the
+    /// timeline, one undo step) and leaves the view alone; one line is enough to keep it.
+    #[test]
+    fn a_quick_double_escape_discards_a_blank_sketch_and_keeps_one_with_a_line() {
+        let mut h = crate::scenario::Harness::new();
+        h.call("ui.view", json!({"view": "iso"}));
+        h.frames(3);
+        let undo = h.app.session.undo.len();
+        h.step(&json!({"start":"sketch.create"})).unwrap();
+        h.step(&json!({"click": {"plane": "XY"}})).unwrap();
+        h.settle();
+        assert!(h.app.session.active_sketch.is_some());
+        h.step(&json!({"key":"Escape"})).unwrap();
+        h.step(&json!({"key":"Escape"})).unwrap();
+        h.settle();
+        crate::scenario::check(&mut h, &json!({"sketching": false, "camera": {"yaw_deg": 0, "pitch_deg": 90}})).unwrap();
+        assert_eq!(h.app.ui.tab, "MODEL");
+        assert!(h.app.session.doc.features.is_empty(), "the blank sketch is gone");
+        assert!(crate::scenario::handles("timeline:").iter().all(|(n, _)| !n.contains("Sketch")));
+        assert!(crate::scenario::handle_at("row:Sketch1").is_none());
+        assert!(h.app.session.undo.len() <= undo + 2, "creating and discarding are at most two steps");
+
+        h.step(&json!({"start":"sketch.create"})).unwrap();
+        h.step(&json!({"click": {"plane": "XY"}})).unwrap();
+        h.app.run("sketch.line", json!({"points": [[0, 0], [30, 10]]})).unwrap();
+        h.settle();
+        h.step(&json!({"key":"Escape"})).unwrap();
+        h.step(&json!({"key":"Escape"})).unwrap();
+        h.settle();
+        assert!(h.app.session.active_sketch.is_none());
+        assert_eq!(h.app.session.doc.features.len(), 1, "a sketch with a line is kept");
+        assert!(crate::scenario::handles("timeline:").iter().any(|(n, _)| n.contains("Sketch")));
     }
 }
